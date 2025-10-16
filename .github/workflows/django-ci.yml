@@ -48,8 +48,11 @@ jobs:
       - name: Empaquetar artefacto (opcional)
         run: |
           tar -czf build.tar.gz \
+            --warning=no-file-changed \
             --exclude='.git' \
             --exclude='.github' \
+            --exclude='**/__pycache__' \
+            --exclude='db.sqlite3' \
             .
 
       - name: Subir artefacto
