@@ -84,38 +84,54 @@ jobs:
         - name: Levantar Django como tarea programada (puerto 8000)
           shell: powershell
           run: |
-            $port = 8000
-            $task = "DjangoRunserver"
-            $wd   = $env:GITHUB_WORKSPACE
+            $ErrorActionPreference = "Stop"
+            $port  = 8000
+            $task  = "DjangoRunserver"
+            $wd    = $env:GITHUB_WORKSPACE
+            $out   = Join-Path $wd "runserver.out.log"
+            $err   = Join-Path $wd "runserver.err.log"
+            $python = (Get-Command python).Source  # ruta completa a python.exe
 
-            # 0) Abrir firewall para 8000 (solo por si acaso)
-            netsh advfirewall firewall add rule name="Django 8000" dir=in action=allow protocol=TCP localport=$port | Out-Null
+            # 0) Abrir firewall para el puerto (idempotente)
+            netsh advfirewall firewall add rule name="Django 8000" dir=in action=allow protocol=TCP localport=$port 2>$null | Out-Null
 
-            # 1) Matar cualquier proceso viejo en ese puerto
+            # 1) Matar procesos que estén usando 8000 (si los hay)
             $conns = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue
             if ($conns) {
               $pids = $conns | Select-Object -ExpandProperty OwningProcess | Sort-Object -Unique
               foreach ($pid in $pids) { try { Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue } catch {} }
             }
 
-            # 2) Borrar tarea si existe
-            schtasks /End /TN $task 2>$null
-            schtasks /Delete /TN $task /F 2>$null
+            # 2) Si la tarea existe, terminarla y borrarla sin fallar el paso
+            schtasks /Query /TN $task 2>$null | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+              schtasks /End    /TN $task 2>$null | Out-Null
+              schtasks /Delete /TN $task /F 2>$null | Out-Null
+            }
 
-            # 3) Crear tarea que arranque runserver fuera del runner
-            $cmd = "powershell -NoProfile -ExecutionPolicy Bypass -Command `"cd '$wd'; `$env:DJANGO_SETTINGS_MODULE='proyecto_cicd.settings'; `$env:DJANGO_DEBUG='true'; `$env:DJANGO_ALLOWED_HOSTS='127.0.0.1,localhost'; python manage.py runserver 0.0.0.0:$port`""
+            # 3) Comando de arranque (con variables y logs)
+            $quotedWd = '"' + $wd + '"'
+            $quotedPy = '"' + $python + '"'
+            $cmd = "powershell -NoProfile -ExecutionPolicy Bypass -Command " +
+                  "`"cd $quotedWd; " +
+                  "`$env:DJANGO_SETTINGS_MODULE='proyecto_cicd.settings'; " +
+                  "`$env:DJANGO_DEBUG='true'; " +
+                  "`$env:DJANGO_ALLOWED_HOSTS='127.0.0.1,localhost'; " +
+                  "& $quotedPy manage.py runserver 0.0.0.0:$port > `"$out`" 2> `"$err`"`""
 
-            schtasks /Create /TN $task /TR $cmd /SC ONCE /ST 23:59 /RL HIGHEST /RU "SYSTEM" /F
+            # 4) Crear y ejecutar la tarea (fuera del árbol del runner)
+            schtasks /Create /TN $task /TR $cmd /SC ONCE /ST 23:59 /RL HIGHEST /RU SYSTEM /F | Out-Null
+            schtasks /Run /TN $task | Out-Null
 
-            # 4) Ejecutar la tarea ahora
-            schtasks /Run /TN $task
+            Start-Sleep -Seconds 6
 
-            Start-Sleep -Seconds 5
-
-            # 5) Verificar que está escuchando y mostrar URL
+            # 5) Verificar que hay algo escuchando en 8000; si no, mostrar logs y fallar
             $ok = Test-NetConnection -ComputerName 127.0.0.1 -Port $port -InformationLevel Quiet
             if (-not $ok) {
-              Write-Host "No hay nada escuchando en $port. Revisa el Visor de eventos > Microsoft > Windows > TaskScheduler."
+              Write-Host "No hay nada escuchando en el puerto $port. Últimas líneas de log:"
+              if (Test-Path $out) { Get-Content $out -Tail 80 | Write-Host }
+              if (Test-Path $err) { Get-Content $err -Tail 80 | Write-Host }
               exit 1
             }
+
             Write-Host "Servidor iniciado por tarea programada en http://127.0.0.1:$port ✅"
