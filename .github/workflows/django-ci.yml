@@ -68,8 +68,9 @@ jobs:
         run: |
           $deploy = "$env:USERPROFILE\deploy\proyecto-ci-cd"
           $pidFile = Join-Path $deploy "runserver.pid"
+          $port = 8000
 
-          # Matar proceso previo si hay PID guardado
+          # 1) Matar por PID guardado
           if (Test-Path $pidFile) {
             try {
               $oldPid = Get-Content $pidFile
@@ -80,10 +81,17 @@ jobs:
             Remove-Item $pidFile -Force -ErrorAction SilentlyContinue
           }
 
-          # Crear carpeta de deploy si no existe
-          if (-not (Test-Path $deploy)) {
-            New-Item -ItemType Directory -Path $deploy | Out-Null
-          }
+          # 2) Matar cualquier proceso que esté usando el puerto (autoreload huérfano, etc.)
+          try {
+            $pidByPort = (netstat -ano | Select-String "LISTENING.*:$port\s").ToString().Split()[-1]
+            if ($pidByPort -match '^\d+$') {
+              Stop-Process -Id [int]$pidByPort -Force -ErrorAction SilentlyContinue
+            }
+          } catch {}
+
+          # 3) Crear carpeta deploy si no existe
+          if (-not (Test-Path $deploy)) { New-Item -ItemType Directory -Path $deploy | Out-Null }
+
 
       # 1) Descargar el artefacto del job CI (sin checkout)
       - name: Download artifact
@@ -138,24 +146,22 @@ jobs:
           $pidFile= Join-Path $deploy "runserver.pid"
           $port   = 8000
 
-          # Abrir firewall (idempotente)
           netsh advfirewall firewall add rule name="Django 8000" dir=in action=allow protocol=TCP localport=$port 2>$null | Out-Null
 
-          # Lanzar en background desde la carpeta de deploy y guardar PID
           $p = Start-Process -FilePath $py `
-                             -ArgumentList "manage.py","runserver","0.0.0.0:$port" `
-                             -WorkingDirectory $deploy `
-                             -RedirectStandardOutput $outLog `
-                             -RedirectStandardError  $errLog `
-                             -PassThru -WindowStyle Hidden
+                            -ArgumentList "manage.py","runserver","0.0.0.0:$port","--noreload" `
+                            -WorkingDirectory $deploy `
+                            -RedirectStandardOutput $outLog `
+                            -RedirectStandardError  $errLog `
+                            -PassThru -WindowStyle Hidden
           $p.Id | Out-File -FilePath $pidFile -Encoding ascii -Force
 
-          # Health-check con reintentos
+          # Health-check
           $deadline = (Get-Date).AddSeconds(25)
           $ok = $false
           do {
             try {
-              $res = Invoke-WebRequest -Uri "http://127.0.0.1:$port/" -UseBasicParsing -TimeoutSec 3
+              $res = Invoke-WebRequest -Uri "http://127.0.0.1:$port/?ts=$(Get-Date -Format o)" -UseBasicParsing -TimeoutSec 3
               if ($res.StatusCode -ge 200 -and $res.StatusCode -lt 500) { $ok = $true }
             } catch { Start-Sleep -Milliseconds 800 }
           } until ($ok -or (Get-Date) -gt $deadline)
