@@ -135,7 +135,7 @@ jobs:
           Pop-Location
 
       # 5) Levantar runserver en background con Start-Process (con logs y PID)
-      - name: Start Django (background) on :8000
+      - name: Start Django via Scheduled Task (persists after job)
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
@@ -143,27 +143,46 @@ jobs:
           $py     = "$deploy\.venv\Scripts\python.exe"
           $outLog = Join-Path $deploy "runserver.out.log"
           $errLog = Join-Path $deploy "runserver.err.log"
-          $pidFile= Join-Path $deploy "runserver.pid"
           $port   = 8000
+          $task   = "DjangoRun$port"
 
-          # ---- Firewall: crear la regla solo si no existe (evita exit code 1 de netsh) ----
-          cmd /c "netsh advfirewall firewall show rule name=""Django 8000""" >$null 2>&1
+          # (1) Firewall idempotente
+          $ruleName = "Django $port"
+          cmd /c "netsh advfirewall firewall show rule name=""$ruleName""" >$null 2>&1
           if ($LASTEXITCODE -ne 0) {
-            cmd /c "netsh advfirewall firewall add rule name=""Django 8000"" dir=in action=allow protocol=TCP localport=$port" >$null 2>&1
+            cmd /c "netsh advfirewall firewall add rule name=""$ruleName"" dir=in action=allow protocol=TCP localport=$port profile=any" >$null 2>&1
           }
-          $global:LASTEXITCODE = 0  # limpiar exit code por si netsh dejó 1
+          $global:LASTEXITCODE = 0
 
-          # ---- Lanzar Django sin autoreload para tener 1 solo proceso confiable ----
-          $p = Start-Process -FilePath $py `
-                            -ArgumentList "manage.py","runserver","0.0.0.0:$port","--noreload" `
-                            -WorkingDirectory $deploy `
-                            -RedirectStandardOutput $outLog `
-                            -RedirectStandardError  $errLog `
-                            -PassThru -WindowStyle Hidden
-          $p.Id | Out-File -FilePath $pidFile -Encoding ascii -Force
+          # (2) Matar procesos viejos por PID y por puerto (por si algo quedó colgado)
+          $pidFile = Join-Path $deploy "runserver.pid"
+          if (Test-Path $pidFile) {
+            try {
+              $oldPid = Get-Content $pidFile
+              if (Get-Process -Id $oldPid -ErrorAction SilentlyContinue) { Stop-Process -Id $oldPid -Force }
+            } catch {}
+            Remove-Item $pidFile -Force -ErrorAction SilentlyContinue
+          }
+          try {
+            $pidByPort = (netstat -ano | Select-String "LISTENING.*:$port\s").ToString().Split()[-1]
+            if ($pidByPort -match '^\d+$') { Stop-Process -Id [int]$pidByPort -Force -ErrorAction SilentlyContinue }
+          } catch {}
 
-          # ---- Health-check ----
-          $deadline = (Get-Date).AddSeconds(25)
+          # (3) Borrar y crear tarea programada que lance runserver SIN autoreload
+          schtasks /End    /TN $task  >$null 2>&1
+          schtasks /Delete /TN $task /F >$null 2>&1
+
+          $args = "manage.py runserver 0.0.0.0:$port --noreload"
+          schtasks /Create /TN $task `
+            /TR "\"$py\" $args" `
+            /SC ONCE /ST 00:00 `
+            /RL HIGHEST /RU SYSTEM `
+            /F /WD "$deploy" | Out-Null
+
+          schtasks /Run /TN $task | Out-Null
+
+          # (4) Health-check (espera a que escuche)
+          $deadline = (Get-Date).AddSeconds(35)
           $ok = $false
           do {
             try {
@@ -179,5 +198,10 @@ jobs:
             exit 1
           }
 
-          Write-Host "Servidor Django UP en http://127.0.0.1:$port ✅ (PID: $(Get-Content $pidFile))"
-          $global:LASTEXITCODE = 0   # <-- asegura success del step
+          # (5) Guardar PID real para depurar y dejar todo verde
+          try {
+            $pid = (netstat -ano | Select-String "LISTENING.*:$port\s").ToString().Split()[-1]
+            if ($pid -match '^\d+$') { $pid | Out-File -FilePath $pidFile -Encoding ascii -Force }
+          } catch {}
+          Write-Host "Django corriendo como Tarea Programada en http://127.0.0.1:$port ✅ (PID: $(Get-Content $pidFile))"
+          $global:LASTEXITCODE = 0
