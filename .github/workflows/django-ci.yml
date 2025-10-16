@@ -1,4 +1,4 @@
-name: Django CI Básico
+name: Django CI/CD (simulado)
 
 on:
   push:
@@ -49,159 +49,66 @@ jobs:
         run: |
           git archive --format=tar.gz -o build.tar.gz HEAD
 
-      - name: Subir artefacto
+      - name: Subir artefacto CI
         uses: actions/upload-artifact@v4
         with:
           name: django-build
           path: build.tar.gz
 
   cd:
-    name: CD - Despliegue local (Self-Hosted, simple)
+    name: CD simulado (no despliega, prepara release)
     needs: ci
-    runs-on: [self-hosted, deploy]
+    runs-on: ubuntu-latest
     if: ${{ github.ref == 'refs/heads/main' && success() }}
 
     steps:
-      # 0) Parar servidor anterior (si existe) y preparar carpeta de deploy
-      - name: Stop previous process & prepare deploy dir
-        shell: powershell
-        run: |
-          $deploy = "$env:USERPROFILE\deploy\proyecto-ci-cd"
-          $pidFile = Join-Path $deploy "runserver.pid"
-          $port = 8000
-
-          # 1) Matar por PID guardado
-          if (Test-Path $pidFile) {
-            try {
-              $oldPid = Get-Content $pidFile
-              if (Get-Process -Id $oldPid -ErrorAction SilentlyContinue) {
-                Stop-Process -Id $oldPid -Force
-              }
-            } catch {}
-            Remove-Item $pidFile -Force -ErrorAction SilentlyContinue
-          }
-
-          # 2) Matar cualquier proceso que esté usando el puerto (autoreload huérfano, etc.)
-          try {
-            $pidByPort = (netstat -ano | Select-String "LISTENING.*:$port\s").ToString().Split()[-1]
-            if ($pidByPort -match '^\d+$') {
-              Stop-Process -Id [int]$pidByPort -Force -ErrorAction SilentlyContinue
-            }
-          } catch {}
-
-          # 3) Crear carpeta deploy si no existe
-          if (-not (Test-Path $deploy)) { New-Item -ItemType Directory -Path $deploy | Out-Null }
-
-
-      # 1) Descargar el artefacto del job CI (sin checkout)
-      - name: Download artifact
+      - name: Descargar artefacto del CI
         uses: actions/download-artifact@v4
         with:
           name: django-build
           path: .
 
-      # 2) Desempaquetar el artefacto en la carpeta de deploy
-      - name: Unpack artifact
-        shell: powershell
+      - name: Desempaquetar a carpeta deploy/
         run: |
-          $deploy = "$env:USERPROFILE\deploy\proyecto-ci-cd"
-          # Limpiar SOLO el contenido del deploy (no la carpeta)
-          Get-ChildItem -Path $deploy -Force | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
-          tar -xzf build.tar.gz -C $deploy
+          mkdir -p deploy
+          tar -xzf build.tar.gz -C deploy
 
-      # 3) Python del runner + venv propio del deploy
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Create venv & install deps
-        shell: powershell
+      - name: Cache pip (CD simulado)
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-cd-${{ hashFiles('deploy/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-cd-
+
+      - name: Instalar deps dentro de deploy/
+        working-directory: deploy
         run: |
-          $deploy = "$env:USERPROFILE\deploy\proyecto-ci-cd"
-          python -m venv "$deploy\.venv"
-          & "$deploy\.venv\Scripts\python.exe" -m pip install --upgrade pip
-          & "$deploy\.venv\Scripts\pip.exe" install -r "$deploy\requirements.txt"
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-      # 4) Migraciones y collectstatic desde el deploy
-      - name: Migrate & collectstatic
-        shell: powershell
+      # Smoke-check sencillo para validar que es desplegable (sin levantar servidor)
+      - name: Smoke check (manage.py check --deploy)
+        working-directory: deploy
+        env:
+          DJANGO_SETTINGS_MODULE: proyecto_cicd.settings
+          DJANGO_SECRET_KEY: dummy-cd
+          DJANGO_DEBUG: "false"
         run: |
-          $deploy = "$env:USERPROFILE\deploy\proyecto-ci-cd"
-          $py = "$deploy\.venv\Scripts\python.exe"
-          Push-Location $deploy
-          & $py manage.py migrate --noinput
-          & $py manage.py collectstatic --noinput
-          Pop-Location
+          python manage.py check --deploy
 
-      # 5) Levantar runserver en background con Start-Process (con logs y PID)
-      - name: Start Django via Scheduled Task (persists after job)
-        shell: powershell
+      # Opcional: empaquetar como "release" listo para copiar a un servidor real
+      - name: Empaquetar release simulado
         run: |
-          $ErrorActionPreference = 'Stop'
-          $deploy = "$env:USERPROFILE\deploy\proyecto-ci-cd"
-          $py     = "$deploy\.venv\Scripts\python.exe"
-          $outLog = Join-Path $deploy "runserver.out.log"
-          $errLog = Join-Path $deploy "runserver.err.log"
-          $port   = 8000
-          $task   = "DjangoRun$port"
+          tar -czf django-release-simulado.tar.gz -C deploy .
 
-          # (1) Firewall idempotente
-          $ruleName = "Django $port"
-          cmd /c "netsh advfirewall firewall show rule name=""$ruleName""" >$null 2>&1
-          if ($LASTEXITCODE -ne 0) {
-            cmd /c "netsh advfirewall firewall add rule name=""$ruleName"" dir=in action=allow protocol=TCP localport=$port profile=any" >$null 2>&1
-          }
-          $global:LASTEXITCODE = 0
-
-          # (2) Matar procesos viejos por PID y por puerto (por si algo quedó colgado)
-          $pidFile = Join-Path $deploy "runserver.pid"
-          if (Test-Path $pidFile) {
-            try {
-              $oldPid = Get-Content $pidFile
-              if (Get-Process -Id $oldPid -ErrorAction SilentlyContinue) { Stop-Process -Id $oldPid -Force }
-            } catch {}
-            Remove-Item $pidFile -Force -ErrorAction SilentlyContinue
-          }
-          try {
-            $pidByPort = (netstat -ano | Select-String "LISTENING.*:$port\s").ToString().Split()[-1]
-            if ($pidByPort -match '^\d+$') { Stop-Process -Id [int]$pidByPort -Force -ErrorAction SilentlyContinue }
-          } catch {}
-
-          # (3) Borrar y crear tarea programada que lance runserver SIN autoreload
-          schtasks /End    /TN $task  >$null 2>&1
-          schtasks /Delete /TN $task /F >$null 2>&1
-
-          $args = "manage.py runserver 0.0.0.0:$port --noreload"
-          schtasks /Create /TN $task `
-            /TR "\"$py\" $args" `
-            /SC ONCE /ST 00:00 `
-            /RL HIGHEST /RU SYSTEM `
-            /F /WD "$deploy" | Out-Null
-
-          schtasks /Run /TN $task | Out-Null
-
-          # (4) Health-check (espera a que escuche)
-          $deadline = (Get-Date).AddSeconds(35)
-          $ok = $false
-          do {
-            try {
-              $res = Invoke-WebRequest -Uri "http://127.0.0.1:$port/?ts=$(Get-Date -Format o)" -UseBasicParsing -TimeoutSec 3
-              if ($res.StatusCode -ge 200 -and $res.StatusCode -lt 500) { $ok = $true }
-            } catch { Start-Sleep -Milliseconds 800 }
-          } until ($ok -or (Get-Date) -gt $deadline)
-
-          if (-not $ok) {
-            Write-Host "No responde http://127.0.0.1:$port. Últimas líneas de logs:"
-            if (Test-Path $outLog) { Get-Content $outLog -Tail 80 | Write-Host }
-            if (Test-Path $errLog) { Get-Content $errLog -Tail 80 | Write-Host }
-            exit 1
-          }
-
-          # (5) Guardar PID real para depurar y dejar todo verde
-          try {
-            $pid = (netstat -ano | Select-String "LISTENING.*:$port\s").ToString().Split()[-1]
-            if ($pid -match '^\d+$') { $pid | Out-File -FilePath $pidFile -Encoding ascii -Force }
-          } catch {}
-          Write-Host "Django corriendo como Tarea Programada en http://127.0.0.1:$port ✅ (PID: $(Get-Content $pidFile))"
-          $global:LASTEXITCODE = 0
+      - name: Subir artefacto de release (simulado)
+        uses: actions/upload-artifact@v4
+        with:
+          name: django-release-simulado
+          path: django-release-simulado.tar.gz
