@@ -81,45 +81,41 @@ jobs:
         - name: Collectstatic
           run: python manage.py collectstatic --noinput
 
-        - name: Reiniciar servidor Django (puerto 8000) con log
+        - name: Levantar Django como tarea programada (puerto 8000)
           shell: powershell
           run: |
             $port = 8000
+            $task = "DjangoRunserver"
+            $wd   = $env:GITHUB_WORKSPACE
 
-            # 1) Cierra cualquier proceso viejo en 8000
+            # 0) Abrir firewall para 8000 (solo por si acaso)
+            netsh advfirewall firewall add rule name="Django 8000" dir=in action=allow protocol=TCP localport=$port | Out-Null
+
+            # 1) Matar cualquier proceso viejo en ese puerto
             $conns = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue
             if ($conns) {
               $pids = $conns | Select-Object -ExpandProperty OwningProcess | Sort-Object -Unique
               foreach ($pid in $pids) { try { Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue } catch {} }
             }
 
-            # 2) Vars mínimas
-            $env:DJANGO_SETTINGS_MODULE = "proyecto_cicd.settings"
-            $env:DJANGO_DEBUG = "true"
-            $env:DJANGO_SECRET_KEY = "selfhosted-demo"
-            $env:DJANGO_ALLOWED_HOSTS = "127.0.0.1,localhost"
+            # 2) Borrar tarea si existe
+            schtasks /End /TN $task 2>$null
+            schtasks /Delete /TN $task /F 2>$null
 
-            # 3) Arranca server y guarda logs en el workspace
-            $wd  = $env:GITHUB_WORKSPACE
-            $out = Join-Path $wd "runserver.out.log"
-            $err = Join-Path $wd "runserver.err.log"
+            # 3) Crear tarea que arranque runserver fuera del runner
+            $cmd = "powershell -NoProfile -ExecutionPolicy Bypass -Command `"cd '$wd'; `$env:DJANGO_SETTINGS_MODULE='proyecto_cicd.settings'; `$env:DJANGO_DEBUG='true'; `$env:DJANGO_ALLOWED_HOSTS='127.0.0.1,localhost'; python manage.py runserver 0.0.0.0:$port`""
 
-            Start-Process -FilePath "python" `
-              -ArgumentList "manage.py","runserver","127.0.0.1:$port" `
-              -WorkingDirectory $wd `
-              -RedirectStandardOutput $out `
-              -RedirectStandardError $err `
-              -WindowStyle Hidden
+            schtasks /Create /TN $task /TR $cmd /SC ONCE /ST 23:59 /RL HIGHEST /RU "SYSTEM" /F
+
+            # 4) Ejecutar la tarea ahora
+            schtasks /Run /TN $task
 
             Start-Sleep -Seconds 5
 
-            # 4) Verifica que esté escuchando; si no, muestra logs y falla
-            $listening = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue
-            if (-not $listening) {
-              Write-Host "No hay proceso escuchando en $port. Últimas líneas de log:"
-              if (Test-Path $out) { Get-Content $out -Tail 100 | Write-Host }
-              if (Test-Path $err) { Get-Content $err -Tail 100 | Write-Host }
+            # 5) Verificar que está escuchando y mostrar URL
+            $ok = Test-NetConnection -ComputerName 127.0.0.1 -Port $port -InformationLevel Quiet
+            if (-not $ok) {
+              Write-Host "No hay nada escuchando en $port. Revisa el Visor de eventos > Microsoft > Windows > TaskScheduler."
               exit 1
             }
-
-            Write-Host "Servidor iniciado en http://127.0.0.1:$port ✅"
+            Write-Host "Servidor iniciado por tarea programada en http://127.0.0.1:$port ✅"
