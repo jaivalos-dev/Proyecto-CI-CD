@@ -82,7 +82,7 @@ jobs:
           run: python manage.py collectstatic --noinput
 
         - name: Reiniciar servidor Django (puerto 8000) con log
-          shell: pwsh
+          shell: powershell
           run: |
             $port = 8000
 
@@ -90,35 +90,35 @@ jobs:
             $conns = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue
             if ($conns) {
               $pids = $conns | Select-Object -ExpandProperty OwningProcess | Sort-Object -Unique
-              foreach ($pid in $pids) { try { Stop-Process -Id $pid -Force } catch {} }
+              foreach ($pid in $pids) { try { Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue } catch {} }
             }
 
-            # 2) Variables para que no falle por hosts ni DEBUG
+            # 2) Vars mínimas
             $env:DJANGO_SETTINGS_MODULE = "proyecto_cicd.settings"
             $env:DJANGO_DEBUG = "true"
             $env:DJANGO_SECRET_KEY = "selfhosted-demo"
             $env:DJANGO_ALLOWED_HOSTS = "127.0.0.1,localhost"
 
-            # 3) Arranca el server en segundo plano y guarda logs
-            $wd = "${{ github.workspace }}"
+            # 3) Arranca server y guarda logs en el workspace
+            $wd  = $env:GITHUB_WORKSPACE
             $out = Join-Path $wd "runserver.out.log"
             $err = Join-Path $wd "runserver.err.log"
 
             Start-Process -FilePath "python" `
-              -ArgumentList "manage.py","runserver","0.0.0.0:$port" `
+              -ArgumentList "manage.py","runserver","127.0.0.1:$port" `
               -WorkingDirectory $wd `
               -RedirectStandardOutput $out `
               -RedirectStandardError $err `
               -WindowStyle Hidden
 
-            Start-Sleep -Seconds 3
+            Start-Sleep -Seconds 5
 
             # 4) Verifica que esté escuchando; si no, muestra logs y falla
-            $listening = (Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue)
+            $listening = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue
             if (-not $listening) {
               Write-Host "No hay proceso escuchando en $port. Últimas líneas de log:"
-              if (Test-Path $out) { Get-Content $out -Tail 80 | Write-Host }
-              if (Test-Path $err) { Get-Content $err -Tail 80 | Write-Host }
+              if (Test-Path $out) { Get-Content $out -Tail 100 | Write-Host }
+              if (Test-Path $err) { Get-Content $err -Tail 100 | Write-Host }
               exit 1
             }
 
