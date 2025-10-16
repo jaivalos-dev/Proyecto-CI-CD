@@ -45,15 +45,9 @@ jobs:
       - name: Tests
         run: python manage.py test --verbosity 2
 
-      - name: Empaquetar artefacto (opcional)
+      - name: Empaquetar artefacto desde HEAD (git archive)
         run: |
-          tar -czf build.tar.gz \
-            --warning=no-file-changed \
-            --exclude='.git' \
-            --exclude='.github' \
-            --exclude='**/__pycache__' \
-            --exclude='db.sqlite3' \
-            .
+          git archive --format=tar.gz -o build.tar.gz HEAD
 
       - name: Subir artefacto
         uses: actions/upload-artifact@v4
