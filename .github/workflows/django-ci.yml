@@ -56,99 +56,115 @@ jobs:
           path: build.tar.gz
 
   cd:
-    name: CD - Despliegue local (Self-Hosted)
+    name: CD - Despliegue local (Self-Hosted, simple)
     needs: ci
     runs-on: [self-hosted, deploy]
     if: ${{ github.ref == 'refs/heads/main' && success() }}
+
     steps:
-      # 0) Detener servidor previo y liberar locks
-      - name: Stop previous Django task & free port
+      # 0) Parar servidor anterior (si existe) y preparar carpeta de deploy
+      - name: Stop previous process & prepare deploy dir
         shell: powershell
-        continue-on-error: true
         run: |
-          $ErrorActionPreference = 'SilentlyContinue'
-          $task = 'DjangoRunserver'
-          if (Get-ScheduledTask -TaskName $task) {
-            Stop-ScheduledTask -TaskName $task
-            Start-Sleep -Seconds 2
-            Unregister-ScheduledTask -TaskName $task -Confirm:$false
-          }
-          # Matar procesos escuchando en 8000
-          $conns = Get-NetTCPConnection -LocalPort 8000 -State Listen
-          if ($conns) {
-            $pids = $conns | Select-Object -ExpandProperty OwningProcess | Sort-Object -Unique
-            foreach ($pid in $pids) { Stop-Process -Id $pid -Force }
-          }
-          Start-Sleep -Seconds 2
+          $deploy = "$env:USERPROFILE\deploy\proyecto-ci-cd"
+          $pidFile = Join-Path $deploy "runserver.pid"
 
-      # 1) Checkout sin limpiar (evita borrar db.sqlite3)
-      - name: Checkout
-        uses: actions/checkout@v4
+          # Matar proceso previo si hay PID guardado
+          if (Test-Path $pidFile) {
+            try {
+              $oldPid = Get-Content $pidFile
+              if (Get-Process -Id $oldPid -ErrorAction SilentlyContinue) {
+                Stop-Process -Id $oldPid -Force
+              }
+            } catch {}
+            Remove-Item $pidFile -Force -ErrorAction SilentlyContinue
+          }
+
+          # Crear carpeta de deploy si no existe
+          if (-not (Test-Path $deploy)) {
+            New-Item -ItemType Directory -Path $deploy | Out-Null
+          }
+
+      # 1) Descargar el artefacto del job CI (sin checkout)
+      - name: Download artifact
+        uses: actions/download-artifact@v4
         with:
-          clean: false     # <--- clave para evitar EBUSY
-          fetch-depth: 0
+          name: django-build
+          path: .
 
-      # 2) Python y deps como ya lo tienes…
-      - name: Configurar entorno Python
+      # 2) Desempaquetar el artefacto en la carpeta de deploy
+      - name: Unpack artifact
+        shell: powershell
+        run: |
+          $deploy = "$env:USERPROFILE\deploy\proyecto-ci-cd"
+          # Limpiar SOLO el contenido del deploy (no la carpeta)
+          Get-ChildItem -Path $deploy -Force | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+          tar -xzf build.tar.gz -C $deploy
+
+      # 3) Python del runner + venv propio del deploy
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Instalar dependencias
+      - name: Create venv & install deps
+        shell: powershell
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          $deploy = "$env:USERPROFILE\deploy\proyecto-ci-cd"
+          python -m venv "$deploy\.venv"
+          & "$deploy\.venv\Scripts\python.exe" -m pip install --upgrade pip
+          & "$deploy\.venv\Scripts\pip.exe" install -r "$deploy\requirements.txt"
 
-      - name: Aplicar migraciones
-        run: python manage.py migrate --noinput
+      # 4) Migraciones y collectstatic desde el deploy
+      - name: Migrate & collectstatic
+        shell: powershell
+        run: |
+          $deploy = "$env:USERPROFILE\deploy\proyecto-ci-cd"
+          $py = "$deploy\.venv\Scripts\python.exe"
+          Push-Location $deploy
+          & $py manage.py migrate --noinput
+          & $py manage.py collectstatic --noinput
+          Pop-Location
 
-      - name: Collectstatic
-        run: python manage.py collectstatic --noinput
-
-      # 3) Tarea programada (versión corregida con LogonType=S4U)
-      - name: Levantar Django como tarea programada (puerto 8000)
+      # 5) Levantar runserver en background con Start-Process (con logs y PID)
+      - name: Start Django (background) on :8000
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
-          Import-Module ScheduledTasks
-
+          $deploy = "$env:USERPROFILE\deploy\proyecto-ci-cd"
+          $py     = "$deploy\.venv\Scripts\python.exe"
+          $outLog = Join-Path $deploy "runserver.out.log"
+          $errLog = Join-Path $deploy "runserver.err.log"
+          $pidFile= Join-Path $deploy "runserver.pid"
           $port   = 8000
-          $task   = 'DjangoRunserver'
-          $wd     = $env:GITHUB_WORKSPACE
-          $ps1    = Join-Path $wd 'run_django.ps1'
-          $outLog = Join-Path $wd 'runserver.out.log'
-          $errLog = Join-Path $wd 'runserver.err.log'
-          $python = (Get-Command python).Source
 
-          # Firewall idempotente
+          # Abrir firewall (idempotente)
           netsh advfirewall firewall add rule name="Django 8000" dir=in action=allow protocol=TCP localport=$port 2>$null | Out-Null
 
-          # Script de arranque con logs
-          @"
-          Set-Location "$wd"
-          `$env:DJANGO_SETTINGS_MODULE = "proyecto_cicd.settings"
-          `$env:DJANGO_DEBUG          = "true"
-          `$env:DJANGO_ALLOWED_HOSTS  = "127.0.0.1,localhost"
-          & "$python" manage.py runserver 0.0.0.0:$port 1>>"$outLog" 2>>"$errLog"
-          "@ | Out-File -FilePath $ps1 -Encoding UTF8 -Force
+          # Lanzar en background desde la carpeta de deploy y guardar PID
+          $p = Start-Process -FilePath $py `
+                             -ArgumentList "manage.py","runserver","0.0.0.0:$port" `
+                             -WorkingDirectory $deploy `
+                             -RedirectStandardOutput $outLog `
+                             -RedirectStandardError  $errLog `
+                             -PassThru -WindowStyle Hidden
+          $p.Id | Out-File -FilePath $pidFile -Encoding ascii -Force
 
-          # Registrar tarea con S4U (o usa SYSTEM si tu entorno no permite S4U)
-          $user = "$($env:USERDOMAIN)\$($env:USERNAME)"
-          $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType S4U -RunLevel Highest
-          # Alternativa:
-          # $principal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+          # Health-check con reintentos
+          $deadline = (Get-Date).AddSeconds(25)
+          $ok = $false
+          do {
+            try {
+              $res = Invoke-WebRequest -Uri "http://127.0.0.1:$port/" -UseBasicParsing -TimeoutSec 3
+              if ($res.StatusCode -ge 200 -and $res.StatusCode -lt 500) { $ok = $true }
+            } catch { Start-Sleep -Milliseconds 800 }
+          } until ($ok -or (Get-Date) -gt $deadline)
 
-          $action  = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$ps1`""
-          $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1)
-
-          Register-ScheduledTask -TaskName $task -Action $action -Trigger $trigger -Principal $principal | Out-Null
-          Start-ScheduledTask -TaskName $task
-
-          Start-Sleep -Seconds 6
-          if (-not (Test-NetConnection -ComputerName 127.0.0.1 -Port $port -InformationLevel Quiet)) {
-            Write-Host "No hay nada en :$port. Últimas líneas:"
+          if (-not $ok) {
+            Write-Host "No responde http://127.0.0.1:$port. Últimas líneas de logs:"
             if (Test-Path $outLog) { Get-Content $outLog -Tail 80 | Write-Host }
             if (Test-Path $errLog) { Get-Content $errLog -Tail 80 | Write-Host }
             exit 1
           }
-          Write-Host "Servidor iniciado en http://127.0.0.1:$port ✅"
+
+          Write-Host "Servidor Django UP en http://127.0.0.1:$port ✅ (PID: $(Get-Content $pidFile))"
